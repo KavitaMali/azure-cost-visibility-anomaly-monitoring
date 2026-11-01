@@ -1,0 +1,234 @@
+{
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "Recurrence": {
+                "recurrence": {
+                    "interval": 1,
+                    "frequency": "Day",
+                    "timeZone": "India Standard Time",
+                    "schedule": {
+                        "hours": [
+                            10
+                        ]
+                    },
+                    "startTime": "2026-10-05T10:10:00"
+                },
+                "evaluatedRecurrence": {
+                    "interval": 1,
+                    "frequency": "Day",
+                    "timeZone": "India Standard Time",
+                    "schedule": {
+                        "hours": [
+                            10
+                        ]
+                    },
+                    "startTime": "2026-10-05T10:10:00"
+                },
+                "type": "Recurrence"
+            }
+        },
+        "actions": {
+            "Get_last_2_days_data": {
+                "runAfter": {
+                    "Initialize_variables": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Http",
+                "inputs": {
+                    "uri": "https://management.azure.com/subscriptions/c13aff80-89eb-4a30-97e5-d0874d4d416b/providers/Microsoft.CostManagement/query?api-version=2023-11-01",
+                    "method": "POST",
+                    "headers": {
+                        "Content-Type": "application/json"
+                    },
+                    "body": {
+                        "type": "ActualCost",
+                        "timeframe": "Custom",
+                        "timePeriod": {
+                            "from": "@{concat(formatDateTime(addDays(utcNow(), -2), 'yyyy-MM-dd'), 'T00:00:00Z')}",
+                            "to": "@{concat(formatDateTime(utcNow(), 'yyyy-MM-dd'), 'T00:00:00Z')}"
+                        },
+                        "dataset": {
+                            "granularity": "Daily",
+                            "aggregation": {
+                                "Cost": {
+                                    "name": "PreTaxCost",
+                                    "function": "Sum"
+                                }
+                            },
+                            "grouping": [
+                                {
+                                    "type": "Dimension",
+                                    "name": "ServiceName"
+                                }
+                            ]
+                        }
+                    },
+                    "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "audience": "https://management.azure.com/"
+                    }
+                },
+                "runtimeConfiguration": {
+                    "contentTransfer": {
+                        "transferMode": "Chunked"
+                    }
+                }
+            },
+            "Shape_rows": {
+                "runAfter": {
+                    "Get_last_2_days_data": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Select",
+                "inputs": {
+                    "from": "@body('Get_last_2_days_data')?['properties']?['rows']",
+                    "select": {
+                        "ServiceName": "@item()[2]",
+                        "UsageDate": "@item()[1]",
+                        "Cost": "@item()[0]"
+                    }
+                }
+            },
+            "Service_names_raw": {
+                "runAfter": {
+                    "Shape_rows": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Select",
+                "inputs": {
+                    "from": "@body('Shape_rows')",
+                    "select": "@item()['ServiceName']"
+                }
+            },
+            "Service_names_unique": {
+                "runAfter": {
+                    "Service_names_raw": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Compose",
+                "inputs": "@union(body('Service_names_raw'),body('Service_names_raw'))"
+            },
+            "For_each_service_": {
+                "foreach": "@outputs('Service_names_unique')",
+                "actions": {
+                    "Percent_change": {
+                        "runAfter": {
+                            "DayBefore_cost": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@if(equals(outputs('DayBefore_cost'), 0), if(greater(outputs('Yesterday_cost'), 0), 100, 0), div(mul(sub(outputs('Yesterday_cost'), outputs('DayBefore_cost')), 100), outputs('DayBefore_cost')))"
+                    },
+                    "Condition": {
+                        "actions": {
+                            "Compose_": {
+                                "type": "Compose",
+                                "inputs": "Service :@{items('For_each_service_')}\nYesterday :  @{outputs('Yesterday_cost')}\nBefore : @{outputs('DayBefore_cost')}\nChange : @{outputs('Percent_change')}"
+                            }
+                        },
+                        "runAfter": {
+                            "Percent_change": [
+                                "Succeeded"
+                            ]
+                        },
+                        "else": {
+                            "actions": {}
+                        },
+                        "expression": {
+                            "and": [
+                                {
+                                    "greater": [
+                                        "@outputs('Percent_change')",
+                                        30
+                                    ]
+                                }
+                            ]
+                        },
+                        "type": "If"
+                    },
+                    "Filter_yesterday": {
+                        "type": "Query",
+                        "inputs": {
+                            "from": "@body('Shape_rows')",
+                            "where": "@and(\n  equals(item()?['ServiceName'], items('For_each_service_')),\n  equals(string(item()?['UsageDate']), variables('Yesterday'))\n)"
+                        }
+                    },
+                    "Filter_daybefore": {
+                        "runAfter": {
+                            "Filter_yesterday": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Query",
+                        "inputs": {
+                            "from": "@body('Shape_rows')",
+                            "where": "@and(\n  equals(item()?['ServiceName'], items('For_each_service_')),\n  equals(string(item()?['UsageDate']), variables('DayBefore'))\n)"
+                        }
+                    },
+                    "Yesterday_cost": {
+                        "runAfter": {
+                            "Filter_daybefore": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@coalesce(first(body('Filter_yesterday'))?['Cost'], 0)"
+                    },
+                    "DayBefore_cost": {
+                        "runAfter": {
+                            "Yesterday_cost": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@coalesce(first(body('Filter_daybefore'))?['Cost'], 0)"
+                    }
+                },
+                "runAfter": {
+                    "Service_names_unique": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Foreach"
+            },
+            "Initialize_variables": {
+                "runAfter": {},
+                "type": "InitializeVariable",
+                "inputs": {
+                    "variables": [
+                        {
+                            "name": "Yesterday",
+                            "type": "string",
+                            "value": "@{int(formatDateTime(addDays(utcNow(), -1), 'yyyyMMdd'))}"
+                        },
+                        {
+                            "name": "DayBefore",
+                            "type": "string",
+                            "value": "@{int(formatDateTime(addDays(utcNow(), -2), 'yyyyMMdd'))}"
+                        }
+                    ]
+                }
+            }
+        },
+        "outputs": {},
+        "parameters": {
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
+        }
+    },
+    "parameters": {
+        "$connections": {
+            "type": "Object",
+            "value": {}
+        }
+    }
+}
